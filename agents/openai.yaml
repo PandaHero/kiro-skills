@@ -1,4 +1,4 @@
 interface:
   display_name: "Kiro Spec Workflow"
-  short_description: "Kiro-style spec workflow for gated planning"
-  default_prompt: "Use $kiro-spec-workflow to turn this feature into gated requirements, design, and task docs before implementation."
+  short_description: "Stateful Kiro-style workflow runtime"
+  default_prompt: "Use $kiro-spec-workflow to create a gated spec and execute one approved task at a time."
