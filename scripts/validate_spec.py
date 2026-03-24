@@ -9,6 +9,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from spec_runtime import VARIANT_CONFIG, load_meta, phases_for_variant
+
 
 REQUIRED_DESIGN_SECTIONS = [
     "Overview",
@@ -73,6 +75,44 @@ def read(path: Path, result: ValidationResult) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def validate_meta(spec_dir: Path, meta: dict, result: ValidationResult) -> None:
+    meta_path = spec_dir / "meta.json"
+    if not meta_path.exists():
+        result.errors.append("Missing file: meta.json")
+        return
+
+    variant = meta.get("variant")
+    if variant not in VARIANT_CONFIG:
+        result.errors.append(f"meta.json has invalid variant: {variant}")
+        return
+
+    phases = phases_for_variant(variant)
+    phase = meta.get("phase")
+    if phase not in phases:
+        result.errors.append(f"meta.json has invalid phase: {phase}")
+
+    expected_docs = set(VARIANT_CONFIG[variant]["docs"])
+    meta_docs = set(meta.get("docs", {}))
+    if expected_docs != meta_docs:
+        result.errors.append(
+            f"meta.json docs do not match variant '{variant}'. Expected {sorted(expected_docs)}, got {sorted(meta_docs)}"
+        )
+
+    approvals = meta.get("approvals", {})
+    if phase in phases:
+        phase_index = phases.index(phase)
+        for prior_phase in phases[:phase_index]:
+            if prior_phase in expected_docs and not approvals.get(prior_phase, False):
+                result.errors.append(
+                    f"meta.json moved past unapproved phase '{prior_phase}'."
+                )
+
+    execution = meta.get("execution", {})
+    current_task = execution.get("current_task")
+    if current_task and phase != "execute":
+        result.errors.append("meta.json has an active task while phase is not 'execute'.")
+
+
 def validate_requirements(path: Path, result: ValidationResult) -> None:
     text = read(path, result)
     if not text:
@@ -120,6 +160,43 @@ def validate_requirements(path: Path, result: ValidationResult) -> None:
                 )
 
 
+def validate_bugfix(path: Path, result: ValidationResult) -> None:
+    text = read(path, result)
+    if not text:
+        return
+
+    for heading in [
+        "# Bugfix Analysis",
+        "## Summary",
+        "## Reproduction",
+        "## Root-Cause Hypothesis",
+        "## Acceptance Criteria",
+    ]:
+        if heading not in text:
+            result.errors.append(f"{path.name} is missing heading: {heading}")
+
+    if PLACEHOLDER_PATTERN.search(text):
+        result.warnings.append(f"{path.name} still contains template placeholders.")
+
+    criteria_match = re.search(r"## Acceptance Criteria\s*$([\s\S]*?)(?=^## |\Z)", text, flags=re.MULTILINE)
+    if not criteria_match:
+        result.errors.append(f"{path.name} is missing acceptance criteria.")
+        return
+
+    criteria_lines = re.findall(r"^\d+\.\s+(.+)$", criteria_match.group(1), flags=re.MULTILINE)
+    if not criteria_lines:
+        result.errors.append(f"{path.name} has no numbered acceptance criteria.")
+        return
+
+    for idx, line in enumerate(criteria_lines, start=1):
+        req_id = f"1.{idx}"
+        result.requirement_ids.add(req_id)
+        if not EARS_PATTERN.match(line.strip()):
+            result.errors.append(
+                f"{path.name} acceptance criterion {req_id} does not appear to use EARS syntax."
+            )
+
+
 def validate_design(path: Path, result: ValidationResult) -> None:
     text = read(path, result)
     if not text:
@@ -153,7 +230,7 @@ def parse_task_blocks(text: str) -> list[dict[str, object]]:
     return items
 
 
-def validate_tasks(path: Path, result: ValidationResult) -> None:
+def validate_tasks(path: Path, meta: dict, result: ValidationResult) -> None:
     text = read(path, result)
     if not text:
         return
@@ -188,14 +265,23 @@ def validate_tasks(path: Path, result: ValidationResult) -> None:
             )
 
         if not has_children:
-            if "Requirements:" not in details:
-                result.errors.append(f"{path.name} task {num} is missing a Requirements reference.")
-            else:
+            if meta["variant"] == "design-first":
+                if "Design References:" not in details and "Requirements:" not in details:
+                    result.errors.append(
+                        f"{path.name} task {num} is missing Design References metadata."
+                    )
                 refs = set(REQ_REF_PATTERN.findall(details))
-                if not refs:
-                    result.errors.append(f"{path.name} task {num} has an empty Requirements reference.")
-                else:
+                if refs:
                     result.referenced_ids.update(refs)
+            else:
+                if "Requirements:" not in details:
+                    result.errors.append(f"{path.name} task {num} is missing a Requirements reference.")
+                else:
+                    refs = set(REQ_REF_PATTERN.findall(details))
+                    if not refs and result.requirement_ids:
+                        result.errors.append(f"{path.name} task {num} has an empty Requirements reference.")
+                    else:
+                        result.referenced_ids.update(refs)
 
             if "Files/Components:" not in details:
                 result.warnings.append(f"{path.name} task {num} is missing Files/Components metadata.")
@@ -207,16 +293,21 @@ def validate_tasks(path: Path, result: ValidationResult) -> None:
                     f"{path.name} task {num} appears to include non-coding work: '{term}'."
                 )
 
-    missing = sorted(result.requirement_ids - result.referenced_ids)
-    if missing:
-        result.errors.append(
-            f"{path.name} does not cover all acceptance criteria. Missing references for: {', '.join(missing)}"
-        )
+    if result.requirement_ids:
+        missing = sorted(result.requirement_ids - result.referenced_ids)
+        if missing:
+            result.errors.append(
+                f"{path.name} does not cover all acceptance criteria. Missing references for: {', '.join(missing)}"
+            )
 
-    unknown = sorted(result.referenced_ids - result.requirement_ids)
-    if unknown:
-        result.errors.append(
-            f"{path.name} references unknown acceptance criteria: {', '.join(unknown)}"
+        unknown = sorted(result.referenced_ids - result.requirement_ids)
+        if unknown:
+            result.errors.append(
+                f"{path.name} references unknown acceptance criteria: {', '.join(unknown)}"
+            )
+    elif meta["variant"] == "design-first":
+        result.warnings.append(
+            f"{path.name} is being validated in design-first mode, so requirement traceability is advisory only."
         )
 
 
@@ -226,11 +317,18 @@ def main() -> int:
     args = parser.parse_args()
 
     spec_dir = Path(args.spec_dir)
+    meta = load_meta(spec_dir)
     result = ValidationResult()
 
-    validate_requirements(spec_dir / "requirements.md", result)
-    validate_design(spec_dir / "design.md", result)
-    validate_tasks(spec_dir / "tasks.md", result)
+    validate_meta(spec_dir, meta, result)
+
+    if meta["variant"] == "feature":
+        validate_requirements(spec_dir / meta["docs"]["requirements"], result)
+    elif meta["variant"] == "bugfix":
+        validate_bugfix(spec_dir / meta["docs"]["bugfix"], result)
+
+    validate_design(spec_dir / meta["docs"]["design"], result)
+    validate_tasks(spec_dir / meta["docs"]["tasks"], meta, result)
 
     return result.emit()
 

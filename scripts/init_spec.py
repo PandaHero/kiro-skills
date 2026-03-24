@@ -6,18 +6,32 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from spec_runtime import VARIANT_CONFIG, default_meta, normalize_feature_name, save_meta, title_case
+
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 REFERENCE_DIR = SKILL_DIR / "references"
 DEFAULT_SPEC_ROOT = Path(".kiro/specs")
+TEMPLATES = {
+    "feature": {
+        "requirements": "requirements-template.md",
+        "design": "design-template.md",
+        "tasks": "tasks-template.md",
+    },
+    "design-first": {
+        "design": "design-template.md",
+        "tasks": "tasks-design-first-template.md",
+    },
+    "bugfix": {
+        "bugfix": "bugfix-template.md",
+        "design": "design-template.md",
+        "tasks": "tasks-bugfix-template.md",
+    },
+}
 
 
 def load_template(name: str) -> str:
     return (REFERENCE_DIR / name).read_text(encoding="utf-8")
-
-
-def title_case(feature_name: str) -> str:
-    return " ".join(part.capitalize() for part in feature_name.replace("_", "-").split("-") if part)
 
 
 def render(template: str, feature_name: str, feature_title: str) -> str:
@@ -38,37 +52,40 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Create .kiro/specs/<feature-name>/ from bundled templates."
     )
-    parser.add_argument("feature_name", help="kebab-case feature name, for example user-authentication")
+    parser.add_argument("feature_name", help="Feature name, for example user-authentication")
     parser.add_argument(
         "--spec-root",
         default=str(DEFAULT_SPEC_ROOT),
-        help="spec root directory, default: .kiro/specs",
+        help="Spec root directory, default: .kiro/specs",
     )
-    parser.add_argument("--title", help="optional human-readable feature title")
+    parser.add_argument("--title", help="Optional human-readable feature title")
+    parser.add_argument(
+        "--variant",
+        choices=sorted(VARIANT_CONFIG),
+        default="feature",
+        help="Workflow variant to initialize",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="overwrite existing files instead of skipping them",
+        help="Overwrite existing files instead of skipping them",
     )
     args = parser.parse_args()
 
-    feature_name = args.feature_name.strip()
+    feature_name = normalize_feature_name(args.feature_name)
     feature_title = args.title.strip() if args.title else title_case(feature_name)
     spec_dir = Path(args.spec_root) / feature_name
     spec_dir.mkdir(parents=True, exist_ok=True)
 
-    files = {
-        "requirements.md": render(
-            load_template("requirements-template.md"), feature_name, feature_title
-        ),
-        "design.md": render(load_template("design-template.md"), feature_name, feature_title),
-        "tasks.md": render(load_template("tasks-template.md"), feature_name, feature_title),
-    }
-
-    for name, content in files.items():
-        result = write_file(spec_dir / name, content, args.overwrite)
+    meta = default_meta(feature_name, args.variant, feature_title)
+    for phase, filename in meta["docs"].items():
+        template_name = TEMPLATES[args.variant][phase]
+        content = render(load_template(template_name), feature_name, feature_title)
+        result = write_file(spec_dir / filename, content, args.overwrite)
         print(result)
 
+    save_meta(spec_dir, meta)
+    print(f"write {spec_dir / 'meta.json'}")
     print(f"spec directory ready: {spec_dir}")
     return 0
 

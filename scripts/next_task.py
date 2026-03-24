@@ -1,73 +1,44 @@
 #!/usr/bin/env python3
-"""Recommend the next executable task from a tasks.md file."""
+"""Recommend the next executable task from a spec directory or tasks.md file."""
 
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
-
-CHECKBOX_PATTERN = re.compile(
-    r"^(?P<indent>\s*)-\s\[(?P<done>[ xX])\]\s+(?P<num>\d+(?:\.\d+){0,1})\.?\s+(?P<desc>.+)$"
-)
+from spec_runtime import choose_next_task, load_meta, load_tasks, save_meta, sync_execution_state
 
 
-def parse_items(text: str) -> list[dict[str, object]]:
-    items: list[dict[str, object]] = []
-    current: dict[str, object] | None = None
-    for line in text.splitlines():
-        match = CHECKBOX_PATTERN.match(line)
-        if match:
-            current = {
-                "num": match.group("num"),
-                "done": match.group("done").lower() == "x",
-                "desc": match.group("desc").strip(),
-                "details": [],
-            }
-            items.append(current)
-            continue
-        if current is not None:
-            current["details"].append(line.rstrip())
-    return items
-
-
-def choose_next(items: list[dict[str, object]]) -> dict[str, object] | None:
-    top_level = [item for item in items if str(item["num"]).count(".") == 0]
-    by_parent: dict[str, list[dict[str, object]]] = {}
-    for item in items:
-        num = str(item["num"])
-        if "." in num:
-            parent = num.split(".", 1)[0]
-            by_parent.setdefault(parent, []).append(item)
-
-    for item in top_level:
-        num = str(item["num"])
-        children = by_parent.get(num, [])
-        if children:
-            for child in children:
-                if not child["done"]:
-                    return child
-            if not item["done"]:
-                return item
-        elif not item["done"]:
-            return item
-    return None
+def resolve_spec_dir(path_str: str) -> Path:
+    path = Path(path_str)
+    if path.name == "tasks.md":
+        return path.parent
+    return path
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Print the next pending task from tasks.md.")
-    parser.add_argument("tasks_file", help="Path to tasks.md")
+    parser = argparse.ArgumentParser(
+        description="Print the next pending task from a spec directory or tasks.md file."
+    )
+    parser.add_argument("path", help="Path to spec directory or tasks.md")
     args = parser.parse_args()
 
-    tasks_file = Path(args.tasks_file)
-    if not tasks_file.exists():
-        print(f"missing file: {tasks_file}")
+    spec_dir = resolve_spec_dir(args.path)
+    if not spec_dir.exists():
+        print(f"missing path: {spec_dir}")
         return 1
 
-    items = parse_items(tasks_file.read_text(encoding="utf-8"))
-    next_item = choose_next(items)
+    meta = load_meta(spec_dir)
+    items = load_tasks(spec_dir, meta)
+    if not items:
+        print("No tasks found.")
+        return 1
+
+    sync_execution_state(meta, items)
+    save_meta(spec_dir, meta)
+
+    next_item = choose_next_task(items, meta["execution"].get("current_task"))
     if not next_item:
         print("No pending tasks found.")
         return 1
